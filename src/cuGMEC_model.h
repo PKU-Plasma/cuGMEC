@@ -45,6 +45,9 @@
 
 #include "cuGMEC_setup.h"
 #include "normalization_spatial.h"
+#include "cuGMEC_output.h"
+#include "output_history.h"
+#include <bit>
 
 using mhdComplex = std::conditional_t<std::is_same_v<mhdReal, double>, cufftDoubleComplex, cufftComplex>;
 
@@ -115,6 +118,8 @@ class HybridModel {
     double normalizationReference[3] = {0.0, 0.0, 0.0};
 
   public:
+    size_t outputSamples = 0; // Number of samples actually recorded, including the initial state.
+
     HybridModel(const HybridModelConfig& cfg)
         :
 
@@ -785,7 +790,21 @@ class HybridModel {
 
     void setup() {
 
+        output_history::validateModes(output_options::toroidalModes, gridNz);
+
         /*-------------------------------------Output Directories-------------------------------------*/
+
+        if constexpr (!output_options::writeCheckpoints || !output_options::writeFinalFields ||
+                      !output_options::toroidalModes.empty()) {
+            int occupied = 0;
+            if (hostId == 0)
+                for (const auto& path : {initialDir, finalDir})
+                    if (std::filesystem::exists(path) && !std::filesystem::is_empty(path))
+                        occupied = 1;
+            MPICHECK(MPI_Bcast(&occupied, 1, MPI_INT, 0, MPI_COMM_WORLD));
+            if (occupied)
+                throw std::runtime_error("Compact output requires empty initial/final directories; choose a fresh outputDir");
+        }
 
         if (hostId == 0) {
             std::filesystem::create_directories(initialDir);
@@ -814,12 +833,15 @@ class HybridModel {
                           fs::copy_options::overwrite_existing);
             if (fs::exists("src/cuGMEC_param.h"))
                 fs::copy_file("src/cuGMEC_param.h", finalDir + "/cuGMEC_param.h", fs::copy_options::overwrite_existing);
+            if (fs::exists("src/cuGMEC_output.h"))
+                fs::copy_file("src/cuGMEC_output.h", finalDir + "/cuGMEC_output.h", fs::copy_options::overwrite_existing);
 
-            if constexpr (std::is_same_v<ifContinue, falseType> || continueSteps == 0) {
+            if constexpr (output_options::writeCheckpoints &&
+                          (std::is_same_v<ifContinue, falseType> || continueSteps == 0)) {
                 fs::copy_file(inputDir + "/" + MHDEquilibrium, initialDir + "/" + MHDEquilibrium,
                               fs::copy_options::overwrite_existing);
             }
-            if constexpr (std::is_same_v<ifContinue, trueType> && continueSteps == 0)
+            if constexpr (output_options::writeCheckpoints && std::is_same_v<ifContinue, trueType> && continueSteps == 0)
                 fs::copy_file(inputDir + "/MHDContinue_0.bin", initialDir + "/MHDContinue_0.bin",
                               fs::copy_options::overwrite_existing);
         }
@@ -2144,20 +2166,23 @@ class HybridModel {
                                 mpiMhdType, 0, MPI_COMM_WORLD));
         };
 
-        gatherField(h_w[0][0], d_w_midl);
-        gatherField(h_A[0][0], d_A_midl);
-        gatherField(h_dNe[0][0], d_dNe_midl);
-        gatherField(h_dTe[0][0], d_dTe_midl);
-        gatherField(h_dP[0][0], d_dP_midl);
-        gatherField(h_Phi[0][0], d_Phi_midl);
-        gatherField(h_dJpB[0][0], d_dJpB_midl);
-        gatherField(h_dPe[0][0], d_dPe_midl);
-        gatherField(h_globalPi[0][0], d_dPi_midl);
-        gatherField(h_globalPa[0][0], d_dPa_midl);
-        gatherField(h_globalPb[0][0], d_dPb_midl);
-        gatherField(h_globalNi[0][0], d_dNi_midl);
-        gatherField(h_globalNa[0][0], d_dNa_midl);
-        gatherField(h_globalNb[0][0], d_dNb_midl);
+        if constexpr (output_options::writeFinalFields || output_options::writeCheckpoints) {
+            gatherField(h_w[0][0], d_w_midl);
+            gatherField(h_A[0][0], d_A_midl);
+            gatherField(h_dNe[0][0], d_dNe_midl);
+            gatherField(h_dTe[0][0], d_dTe_midl);
+            gatherField(h_dP[0][0], d_dP_midl);
+            gatherField(h_Phi[0][0], d_Phi_midl);
+            gatherField(h_dJpB[0][0], d_dJpB_midl);
+            gatherField(h_dPe[0][0], d_dPe_midl);
+            gatherField(h_globalPi[0][0], d_dPi_midl);
+            gatherField(h_globalPa[0][0], d_dPa_midl);
+            gatherField(h_globalPb[0][0], d_dPb_midl);
+            gatherField(h_globalNi[0][0], d_dNi_midl);
+            gatherField(h_globalNa[0][0], d_dNa_midl);
+            gatherField(h_globalNb[0][0], d_dNb_midl);
+
+        }
 
         /*-------------------------------Output Totals (8 conditional)--------------------------------*/
 
@@ -2226,87 +2251,160 @@ class HybridModel {
 
         /*------------------------------PIC Keys / Values (per species)-------------------------------*/
 
-        if (ifIon) {
-            for (int i = 0; i < devNums; i++) {
-                CUDACHECK(cudaSetDevice(localId * devNums + i));
-                CUDACHECK(cudaMemcpy(h_Ion_keys[i], d_Ion_keys_in[i], sizeof(int) * picDev, cudaMemcpyDeviceToHost));
-                CUDACHECK(cudaMemcpy(h_Ion_values[i], d_Ion_values_in[i], sizeof(picReal) * picDev * 7,
-                                     cudaMemcpyDeviceToHost));
+        if constexpr (output_options::writeCheckpoints) {
+            if (ifIon) {
+                for (int i = 0; i < devNums; i++) {
+                    CUDACHECK(cudaSetDevice(localId * devNums + i));
+                    CUDACHECK(cudaMemcpy(h_Ion_keys[i], d_Ion_keys_in[i], sizeof(int) * picDev, cudaMemcpyDeviceToHost));
+                    CUDACHECK(cudaMemcpy(h_Ion_values[i], d_Ion_values_in[i], sizeof(picReal) * picDev * 7,
+                                         cudaMemcpyDeviceToHost));
+                }
             }
-        }
-        if (ifAlpha) {
-            for (int i = 0; i < devNums; i++) {
-                CUDACHECK(cudaSetDevice(localId * devNums + i));
-                CUDACHECK(
-                    cudaMemcpy(h_Alpha_keys[i], d_Alpha_keys_in[i], sizeof(int) * picDev, cudaMemcpyDeviceToHost));
-                CUDACHECK(cudaMemcpy(h_Alpha_values[i], d_Alpha_values_in[i], sizeof(picReal) * picDev * 7,
-                                     cudaMemcpyDeviceToHost));
+            if (ifAlpha) {
+                for (int i = 0; i < devNums; i++) {
+                    CUDACHECK(cudaSetDevice(localId * devNums + i));
+                    CUDACHECK(
+                        cudaMemcpy(h_Alpha_keys[i], d_Alpha_keys_in[i], sizeof(int) * picDev, cudaMemcpyDeviceToHost));
+                    CUDACHECK(cudaMemcpy(h_Alpha_values[i], d_Alpha_values_in[i], sizeof(picReal) * picDev * 7,
+                                         cudaMemcpyDeviceToHost));
+                }
             }
-        }
-        if (ifBeam) {
-            for (int i = 0; i < devNums; i++) {
-                CUDACHECK(cudaSetDevice(localId * devNums + i));
-                CUDACHECK(cudaMemcpy(h_Beam_keys[i], d_Beam_keys_in[i], sizeof(int) * picDev, cudaMemcpyDeviceToHost));
-                CUDACHECK(cudaMemcpy(h_Beam_values[i], d_Beam_values_in[i], sizeof(picReal) * picDev * 7,
-                                     cudaMemcpyDeviceToHost));
+            if (ifBeam) {
+                for (int i = 0; i < devNums; i++) {
+                    CUDACHECK(cudaSetDevice(localId * devNums + i));
+                    CUDACHECK(cudaMemcpy(h_Beam_keys[i], d_Beam_keys_in[i], sizeof(int) * picDev, cudaMemcpyDeviceToHost));
+                    CUDACHECK(cudaMemcpy(h_Beam_values[i], d_Beam_values_in[i], sizeof(picReal) * picDev * 7,
+                                         cudaMemcpyDeviceToHost));
+                }
             }
-        }
 
-        /*-----------------------------------PIC Continuation File------------------------------------*/
+            /*-----------------------------------PIC Continuation File------------------------------------*/
 
-        const size_t keysBytes = sizeof(int) * (size_t)devNums * picDev;
-        const size_t valuesBytes = sizeof(picReal) * (size_t)devNums * picDev * 7;
-        const size_t speciesSize = sizeof(picReal) + keysBytes + valuesBytes;
-        const int enabledCount = (ifIon ? 1 : 0) + (ifAlpha ? 1 : 0) + (ifBeam ? 1 : 0);
-        const size_t rankSize = enabledCount * speciesSize;
-        const size_t fileSize = (size_t)hostNums * rankSize;
+            const size_t keysBytes = sizeof(int) * (size_t)devNums * picDev;
+            const size_t valuesBytes = sizeof(picReal) * (size_t)devNums * picDev * 7;
+            const size_t speciesSize = sizeof(picReal) + keysBytes + valuesBytes;
+            const int enabledCount = (ifIon ? 1 : 0) + (ifAlpha ? 1 : 0) + (ifBeam ? 1 : 0);
+            const size_t rankSize = enabledCount * speciesSize;
+            const size_t fileSize = (size_t)hostNums * rankSize;
 
-        auto writeBytes = [&](MPI_File fileHandle, size_t offset, const void* data, size_t bytes) {
-            constexpr size_t chunkBytes = 1ULL << 30;
-            const char* ptr = reinterpret_cast<const char*>(data);
+            auto writeBytes = [&](MPI_File fileHandle, size_t offset, const void* data, size_t bytes) {
+                constexpr size_t chunkBytes = 1ULL << 30;
+                const char* ptr = reinterpret_cast<const char*>(data);
 
-            for (size_t done = 0; done < bytes;) {
-                const size_t chunk = (bytes - done > chunkBytes) ? chunkBytes : bytes - done;
-                MPICHECK(MPI_File_write_at_all(fileHandle, (MPI_Offset)(offset + done), const_cast<char*>(ptr + done),
-                                               (int)chunk, MPI_BYTE, MPI_STATUS_IGNORE));
-                done += chunk;
+                for (size_t done = 0; done < bytes;) {
+                    const size_t chunk = (bytes - done > chunkBytes) ? chunkBytes : bytes - done;
+                    MPICHECK(MPI_File_write_at_all(fileHandle, (MPI_Offset)(offset + done), const_cast<char*>(ptr + done),
+                                                   (int)chunk, MPI_BYTE, MPI_STATUS_IGNORE));
+                    done += chunk;
+                }
+            };
+
+            auto writeFinalPicData = [&](picReal* picConst, int** picKeys, picReal** picValues, size_t intraRankOffset) {
+                const std::string filename =
+                    finalDir + "/PICContinue_" + std::to_string(continueSteps + totalSteps) + ".bin";
+                const size_t offset = (size_t)hostId * rankSize + intraRankOffset;
+
+                MPI_File fileHandle;
+                MPICHECK(MPI_File_open(MPI_COMM_WORLD, filename.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL,
+                                       &fileHandle));
+                MPICHECK(MPI_File_set_size(fileHandle, (MPI_Offset)fileSize));
+
+                writeBytes(fileHandle, offset, picConst, sizeof(picReal));
+                writeBytes(fileHandle, offset + sizeof(picReal), picKeys[0], keysBytes);
+                writeBytes(fileHandle, offset + sizeof(picReal) + keysBytes, picValues[0], valuesBytes);
+
+                MPICHECK(MPI_File_close(&fileHandle));
+            };
+
+            size_t off = 0;
+            if (ifIon) {
+                writeFinalPicData(&IonConst, h_Ion_keys, h_Ion_values, off);
+                off += speciesSize;
             }
-        };
+            if (ifAlpha) {
+                writeFinalPicData(&AlphaConst, h_Alpha_keys, h_Alpha_values, off);
+                off += speciesSize;
+            }
+            if (ifBeam)
+                writeFinalPicData(&BeamConst, h_Beam_keys, h_Beam_values, off);
 
-        auto writeFinalPicData = [&](picReal* picConst, int** picKeys, picReal** picValues, size_t intraRankOffset) {
-            const std::string filename =
-                finalDir + "/PICContinue_" + std::to_string(continueSteps + totalSteps) + ".bin";
-            const size_t offset = (size_t)hostId * rankSize + intraRankOffset;
-
-            MPI_File fileHandle;
-            MPICHECK(MPI_File_open(MPI_COMM_WORLD, filename.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL,
-                                   &fileHandle));
-            MPICHECK(MPI_File_set_size(fileHandle, (MPI_Offset)fileSize));
-
-            writeBytes(fileHandle, offset, picConst, sizeof(picReal));
-            writeBytes(fileHandle, offset + sizeof(picReal), picKeys[0], keysBytes);
-            writeBytes(fileHandle, offset + sizeof(picReal) + keysBytes, picValues[0], valuesBytes);
-
-            MPICHECK(MPI_File_close(&fileHandle));
-        };
-
-        size_t off = 0;
-        if (ifIon) {
-            writeFinalPicData(&IonConst, h_Ion_keys, h_Ion_values, off);
-            off += speciesSize;
         }
-        if (ifAlpha) {
-            writeFinalPicData(&AlphaConst, h_Alpha_keys, h_Alpha_values, off);
-            off += speciesSize;
-        }
-        if (ifBeam)
-            writeFinalPicData(&BeamConst, h_Beam_keys, h_Beam_values, off);
 
         /*--------------------------------------Bin File Output---------------------------------------*/
 
         auto writeBin = [&](const std::string& path, const void* data, size_t bytes) {
             std::ofstream o(path, std::ios::out | std::ios::binary);
             o.write((const char*)data, bytes);
+        };
+
+        if (hostId == 0) {
+            std::ofstream metadata;
+            metadata.exceptions(std::ios::failbit | std::ios::badbit);
+            metadata.open(finalDir + "/output_metadata.json");
+            metadata << std::setprecision(std::numeric_limits<double>::max_digits10)
+                     << "{\n  \"format\": \"cuGMEC.history.v1\",\n  \"scalar\": \""
+                     << (std::is_same_v<mhdReal, double> ? "float64" : "float32")
+                     << "\",\n  \"byte_order\": \""
+                     << (std::endian::native == std::endian::little ? "little" : "big")
+                     << "\",\n  \"layout\": \""
+                     << (output_options::toroidalModes.empty() ? "time,y,x,z" : "time,y,x,mode,real_imag")
+                     << "\",\n  \"valid_samples\": " << outputSamples
+                     << ",\n  \"stored_samples\": "
+                     << (output_options::toroidalModes.empty() ? totalSteps / outputSteps + 1 : outputSamples)
+                     << ",\n  \"grid\": [" << gridNy << ", " << gridNx << ", " << gridNz << "]"
+                     << ",\n  \"tubes\": " << tubes << ",\n  \"rho_bounds\": [" << RHO0 << ", " << RHO1 << "]"
+                     << ",\n  \"initial_step\": " << continueSteps << ",\n  \"output_steps\": " << outputSteps
+                     << ",\n  \"step_seconds\": " << dt * L0 / VA0
+                     << ",\n  \"fourier_convention\": \"sum_k f[k]*exp(-2*pi*i*n*k/Nz)/Nz; no coordinate phase shift\""
+                     << ",\n  \"modes\": [";
+            for (size_t mode = 0; mode < output_options::toroidalModes.size(); ++mode)
+                metadata << (mode ? ", " : "") << output_options::toroidalModes[mode];
+            metadata << "],\n  \"histories\": [";
+            bool first = true;
+            auto historyName = [&](bool enabled, const char* name) {
+                if (!enabled)
+                    return;
+                metadata << (first ? "" : ", ") << '"' << name
+                         << (output_options::toroidalModes.empty() ? ".bin\"" : "Modes.bin\"");
+                first = false;
+            };
+            historyName(ifOutputPhi, "totalPhi");
+            historyName(ifOutputA, "totalA");
+            historyName(ifOutputdNe, "totaldNe");
+            historyName(ifOutputdTe, "totaldTe");
+            historyName(ifOutputdP, "totaldP");
+            historyName(ifOutputdPi, "totaldPi");
+            historyName(ifOutputdPa, "totaldPa");
+            historyName(ifOutputdPb, "totaldPb");
+            metadata << "],\n  \"restart_input\": " << (toBool<ifContinue> ? "true" : "false")
+                     << ",\n  \"write_checkpoints\": " << (output_options::writeCheckpoints ? "true" : "false")
+                     << ",\n  \"write_final_fields\": " << (output_options::writeFinalFields ? "true" : "false")
+                     << ",\n  \"particle_constants\": {";
+            first = true;
+            auto particleConstant = [&](const char* name, picReal value) {
+                metadata << (first ? "" : ", ") << '"' << name << "\": ";
+                if (std::isfinite(value))
+                    metadata << value;
+                else
+                    metadata << "null";
+                first = false;
+            };
+            if (ifIon)
+                particleConstant("Ion", IonConst);
+            if (ifAlpha)
+                particleConstant("Alpha", AlphaConst);
+            if (ifBeam)
+                particleConstant("Beam", BeamConst);
+            metadata << "}\n}\n";
+            metadata.close();
+        }
+
+        auto writeHistory = [&](const std::string& name, const std::vector<mhdReal>& values) {
+            if constexpr (output_options::toroidalModes.empty())
+                writeBin(finalDir + "/" + name + ".bin", values.data(), sizeof(mhdReal) * values.size());
+            else
+                output_history::writeModes(finalDir + "/" + name + "Modes.bin", values, outputSamples,
+                                           gridNy, gridNx, gridNz, output_options::toroidalModes);
         };
 
         if (hostId == hostNums / 2) {
@@ -2356,21 +2454,21 @@ class HybridModel {
             }
 
             if (ifOutputPhi)
-                writeBin(finalDir + "/totalPhi.bin", h_totalPhi.data(), sizeof(mhdReal) * h_totalPhi.size());
+                writeHistory("totalPhi", h_totalPhi);
             if (ifOutputA)
-                writeBin(finalDir + "/totalA.bin", h_totalA.data(), sizeof(mhdReal) * h_totalA.size());
+                writeHistory("totalA", h_totalA);
             if (ifOutputdNe)
-                writeBin(finalDir + "/totaldNe.bin", h_totaldNe.data(), sizeof(mhdReal) * h_totaldNe.size());
+                writeHistory("totaldNe", h_totaldNe);
             if (ifOutputdTe)
-                writeBin(finalDir + "/totaldTe.bin", h_totaldTe.data(), sizeof(mhdReal) * h_totaldTe.size());
+                writeHistory("totaldTe", h_totaldTe);
             if (ifOutputdP)
-                writeBin(finalDir + "/totaldP.bin", h_totaldP.data(), sizeof(mhdReal) * h_totaldP.size());
+                writeHistory("totaldP", h_totaldP);
             if (ifOutputdPi)
-                writeBin(finalDir + "/totaldPi.bin", h_totaldPi.data(), sizeof(mhdReal) * h_totaldPi.size());
+                writeHistory("totaldPi", h_totaldPi);
             if (ifOutputdPa)
-                writeBin(finalDir + "/totaldPa.bin", h_totaldPa.data(), sizeof(mhdReal) * h_totaldPa.size());
+                writeHistory("totaldPa", h_totaldPa);
             if (ifOutputdPb)
-                writeBin(finalDir + "/totaldPb.bin", h_totaldPb.data(), sizeof(mhdReal) * h_totaldPb.size());
+                writeHistory("totaldPb", h_totaldPb);
 
             if constexpr (std::is_same_v<ifOutputPhaseSpaceDeltaF, trueType>) {
 
@@ -2538,54 +2636,59 @@ class HybridModel {
                              sizeof(mhdReal) * h_BeamPitchPower.size());
             }
 
-            writeBin(finalDir + "/w.bin", h_w[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/A.bin", h_A[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dNe.bin", h_dNe[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dTe.bin", h_dTe[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dP.bin", h_dP[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/Phi.bin", h_Phi[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dJpB.bin", h_dJpB[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dPe.bin", h_dPe[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dPi.bin", h_globalPi[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dPa.bin", h_globalPa[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dPb.bin", h_globalPb[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dNi.bin", h_globalNi[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dNa.bin", h_globalNa[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
-            writeBin(finalDir + "/dNb.bin", h_globalNb[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+            if constexpr (output_options::writeFinalFields) {
+                writeBin(finalDir + "/w.bin", h_w[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/A.bin", h_A[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dNe.bin", h_dNe[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dTe.bin", h_dTe[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dP.bin", h_dP[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/Phi.bin", h_Phi[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dJpB.bin", h_dJpB[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dPe.bin", h_dPe[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dPi.bin", h_globalPi[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dPa.bin", h_globalPa[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dPb.bin", h_globalPb[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dNi.bin", h_globalNi[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dNa.bin", h_globalNa[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
+                writeBin(finalDir + "/dNb.bin", h_globalNb[0][0] + gridGhost * gridNxz, sizeof(mhdReal) * gridNy * gridNxz);
 
-            std::vector<mhdReal> MHDFinalPerturbation(gridNy * gridNxz * 11);
-
-            for (int j = 0; j < gridNy; j++) {
-                for (int i = 0; i < gridNx; i++) {
-                    for (int k = 0; k < gridNz; k++) {
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 0 * gridNy * gridNxz] =
-                            h_Phi[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 1 * gridNy * gridNxz] =
-                            h_A[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 2 * gridNy * gridNxz] =
-                            h_dNe[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 3 * gridNy * gridNxz] =
-                            h_dTe[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 4 * gridNy * gridNxz] =
-                            h_dP[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 5 * gridNy * gridNxz] =
-                            h_globalPi[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 6 * gridNy * gridNxz] =
-                            h_globalPa[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 7 * gridNy * gridNxz] =
-                            h_globalPb[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 8 * gridNy * gridNxz] =
-                            h_globalNi[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 9 * gridNy * gridNxz] =
-                            h_globalNa[j + gridGhost][i][k];
-                        MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 10 * gridNy * gridNxz] =
-                            h_globalNb[j + gridGhost][i][k];
-                    }
-                }
             }
 
-            writeBin(finalDir + "/MHDContinue_" + std::to_string(continueSteps + totalSteps) + ".bin",
-                     MHDFinalPerturbation.data(), sizeof(mhdReal) * MHDFinalPerturbation.size());
+            if constexpr (output_options::writeCheckpoints) {
+                std::vector<mhdReal> MHDFinalPerturbation(gridNy * gridNxz * 11);
+
+                for (int j = 0; j < gridNy; j++) {
+                    for (int i = 0; i < gridNx; i++) {
+                        for (int k = 0; k < gridNz; k++) {
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 0 * gridNy * gridNxz] =
+                                h_Phi[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 1 * gridNy * gridNxz] =
+                                h_A[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 2 * gridNy * gridNxz] =
+                                h_dNe[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 3 * gridNy * gridNxz] =
+                                h_dTe[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 4 * gridNy * gridNxz] =
+                                h_dP[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 5 * gridNy * gridNxz] =
+                                h_globalPi[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 6 * gridNy * gridNxz] =
+                                h_globalPa[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 7 * gridNy * gridNxz] =
+                                h_globalPb[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 8 * gridNy * gridNxz] =
+                                h_globalNi[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 9 * gridNy * gridNxz] =
+                                h_globalNa[j + gridGhost][i][k];
+                            MHDFinalPerturbation[j * gridNxz + i * gridNz + k + 10 * gridNy * gridNxz] =
+                                h_globalNb[j + gridGhost][i][k];
+                        }
+                    }
+                }
+
+                writeBin(finalDir + "/MHDContinue_" + std::to_string(continueSteps + totalSteps) + ".bin",
+                         MHDFinalPerturbation.data(), sizeof(mhdReal) * MHDFinalPerturbation.size());
+            }
         }
 
         if (hostId == 0) {
@@ -2901,15 +3004,18 @@ class HybridModel {
         }
 
         if (hostId == 0) {
-            std::vector<mhdReal> buf(gridNy * gridNxz * 11, 0);
-            for (int j = 0; j < gridNy; j++)
-                for (int i = 0; i < gridNx; i++)
-                    for (int k = 0; k < gridNz; k++)
-                        buf[j * gridNxz + i * gridNz + k + 0 * gridNy * gridNxz] = h_Phi[j + gridGhost][i][k];
+            if constexpr (output_options::writeCheckpoints) {
+                std::vector<mhdReal> buf(gridNy * gridNxz * 11, 0);
+                for (int j = 0; j < gridNy; j++)
+                    for (int i = 0; i < gridNx; i++)
+                        for (int k = 0; k < gridNz; k++)
+                            buf[j * gridNxz + i * gridNz + k + 0 * gridNy * gridNxz] = h_Phi[j + gridGhost][i][k];
 
-            std::ofstream output(initialDir + "/MHDContinue_0.bin", std::ios::out | std::ios::binary);
-            output.write(reinterpret_cast<char*>(buf.data()), sizeof(mhdReal) * buf.size());
-            output.close();
+                std::ofstream output(initialDir + "/MHDContinue_0.bin", std::ios::out | std::ios::binary);
+                output.write(reinterpret_cast<char*>(buf.data()), sizeof(mhdReal) * buf.size());
+                output.close();
+
+            }
 
             logDone();
         }
@@ -5781,34 +5887,37 @@ class HybridModel {
             output.close();
         }
 
-        const int enabledCount = (ifIon ? 1 : 0) + (ifAlpha ? 1 : 0) + (ifBeam ? 1 : 0);
-        const size_t rankSize = enabledCount * speciesSize;
-        const size_t fileSize = (size_t)hostNums * rankSize;
-        const size_t offset = (size_t)hostId * rankSize + intraRankOffset;
-        const std::string picFile = initialDir + "/PICContinue_0.bin";
+        if constexpr (output_options::writeCheckpoints) {
+            const int enabledCount = (ifIon ? 1 : 0) + (ifAlpha ? 1 : 0) + (ifBeam ? 1 : 0);
+            const size_t rankSize = enabledCount * speciesSize;
+            const size_t fileSize = (size_t)hostNums * rankSize;
+            const size_t offset = (size_t)hostId * rankSize + intraRankOffset;
+            const std::string picFile = initialDir + "/PICContinue_0.bin";
 
-        auto writeBytes = [&](MPI_File fileHandle, size_t offset, const void* data, size_t bytes) {
-            constexpr size_t chunkBytes = 1ULL << 30;
-            const char* ptr = reinterpret_cast<const char*>(data);
+            auto writeBytes = [&](MPI_File fileHandle, size_t offset, const void* data, size_t bytes) {
+                constexpr size_t chunkBytes = 1ULL << 30;
+                const char* ptr = reinterpret_cast<const char*>(data);
 
-            for (size_t done = 0; done < bytes;) {
-                const size_t chunk = (bytes - done > chunkBytes) ? chunkBytes : bytes - done;
-                MPICHECK(MPI_File_write_at_all(fileHandle, (MPI_Offset)(offset + done), const_cast<char*>(ptr + done),
-                                               (int)chunk, MPI_BYTE, MPI_STATUS_IGNORE));
-                done += chunk;
-            }
-        };
+                for (size_t done = 0; done < bytes;) {
+                    const size_t chunk = (bytes - done > chunkBytes) ? chunkBytes : bytes - done;
+                    MPICHECK(MPI_File_write_at_all(fileHandle, (MPI_Offset)(offset + done), const_cast<char*>(ptr + done),
+                                                   (int)chunk, MPI_BYTE, MPI_STATUS_IGNORE));
+                    done += chunk;
+                }
+            };
 
-        MPI_File fileHandle;
-        MPICHECK(MPI_File_open(MPI_COMM_WORLD, picFile.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL,
-                               &fileHandle));
-        MPICHECK(MPI_File_set_size(fileHandle, (MPI_Offset)fileSize));
+            MPI_File fileHandle;
+            MPICHECK(MPI_File_open(MPI_COMM_WORLD, picFile.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL,
+                                   &fileHandle));
+            MPICHECK(MPI_File_set_size(fileHandle, (MPI_Offset)fileSize));
 
-        writeBytes(fileHandle, offset, picConst, sizeof(picReal));
-        writeBytes(fileHandle, offset + sizeof(picReal), picKeys[0], keysBytes);
-        writeBytes(fileHandle, offset + sizeof(picReal) + keysBytes, picValues[0], valuesBytes);
+            writeBytes(fileHandle, offset, picConst, sizeof(picReal));
+            writeBytes(fileHandle, offset + sizeof(picReal), picKeys[0], keysBytes);
+            writeBytes(fileHandle, offset + sizeof(picReal) + keysBytes, picValues[0], valuesBytes);
 
-        MPICHECK(MPI_File_close(&fileHandle));
+            MPICHECK(MPI_File_close(&fileHandle));
+
+        }
 
         if (hostId == 0) {
 

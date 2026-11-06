@@ -195,3 +195,75 @@ Notation:
 | `sortSteps` | Integer | Particle sorting interval. |  | `const int sortSteps = 25;` |
 | `diagSteps` | Integer | Diagnostic sampling interval. |  | `const int diagSteps = 1;` |
 | `outputSteps` | Integer | Field and phase-space output interval. |  | `const int outputSteps = 2500;` |
+
+## Compact output for mode comparisons
+
+`src/cuGMEC_output.h` controls output independently of restart input. Its defaults
+preserve the full-history, final-field and checkpoint files. To retain one
+resolved toroidal Fourier component without checkpoints or final 3D snapshots:
+
+```cpp
+namespace output_options {
+inline constexpr bool writeCheckpoints = false;
+inline constexpr bool writeFinalFields = false;
+inline constexpr std::array<int, 1> toroidalModes = {1};
+}
+```
+
+This selects FFT index 1 (physical toroidal number `tubes`). Any distinct indices
+from zero through `gridNz/2` may be selected; an empty list keeps full 3D histories.
+The existing `ifOutputPhi`, `ifOutputA`, etc. switches still select which histories
+are recorded. `outputSteps`, sampling times, native spatial grids, loading,
+normalization, evolution and field feedback are unchanged. Projection occurs on
+the host **after evolution**. This reduces disk output, not the original history
+buffer allocations or their device-to-host copies.
+
+For each enabled history, `totalPhiModes.bin`, `totalAModes.bin`, etc. contain
+interleaved real/imaginary scalars in `[time, y, x, selected_mode, 2]` order. They
+represent `numpy.fft.rfft(full_history, axis=-1)[..., n] / gridNz`, with the negative
+exponential convention and no physical-coordinate phase correction. Floating-point
+summation can differ from an FFT at rounding level. No amplitude factor of two is
+applied, including at zero or Nyquist frequency. Negative-frequency coefficients
+of the original real field follow by complex conjugation. Modes not selected
+cannot be reconstructed. This retains the complete selected field time series,
+not fitted growth rates or one poloidal slice.
+
+`final/output_metadata.json` records scalar precision, byte order, dimensions,
+selected indices, file names, sampling stride, time normalization, restart offset,
+and full-precision particle normalization constants. Sample `s` is at
+`(initial_step + s * output_steps) * step_seconds`. `valid_samples` counts actual
+calls to the native sampling path, including the initial state; compact histories
+omit unrecorded tails after an early stop. Legacy full histories keep their original
+allocated length, reported separately as `stored_samples`.
+
+Nondefault output policies require empty `initial` and `final` directories, to avoid
+mixing new results with stale checkpoints or histories; choose a fresh `outputDir`.
+Existing files are never deleted automatically.
+
+Turning off checkpoints omits initial/final PIC and MHD restart outputs and the
+final particle copies used only to save them. It does not disable reading a supplied
+restart (`ifContinue`). Such a run cannot subsequently be restarted from its omitted
+checkpoints. Turning off final fields omits the separate final 3D snapshots; the
+14-field final gather is skipped only when both snapshots and checkpoints are off.
+Initial pressure/density diagnostics remain, with one equilibrium/parameter snapshot
+in `final`, plus a copy of the output policy. Preserve these files with the source
+commit, input hashes and the full selected histories for reproducible comparisons.
+
+For example, read a compact Phi history with NumPy (requires `totalPhiModes.bin`
+to be enabled):
+
+```python
+import json
+from pathlib import Path
+import numpy as np
+
+folder = Path("output/final")
+meta = json.loads((folder / "output_metadata.json").read_text())
+endian = "<" if meta["byte_order"] == "little" else ">"
+dtype = np.dtype(meta["scalar"]).newbyteorder(endian)
+ny, nx, nz = meta["grid"]
+shape = (meta["stored_samples"], ny, nx, len(meta["modes"]), 2)
+raw = np.fromfile(folder / "totalPhiModes.bin", dtype=dtype).reshape(shape)
+phi = raw[..., 0] + 1j * raw[..., 1]
+times = (meta["initial_step"] + np.arange(len(phi)) * meta["output_steps"]) * meta["step_seconds"]
+```

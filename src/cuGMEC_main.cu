@@ -721,6 +721,7 @@ int main(int argc, char* argv[]) {
     auto runOutput = [&](int outputIdx) {
         if (outputIdx % outputSteps != 0)
             return;
+        cuGMEC.outputSamples = static_cast<size_t>(outputIdx) / outputSteps + 1;
 
         ncclGroupStart();
         for (int i = 0; i < devNums; i++) {
