@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "cuGMEC_setup.h"
+#include "normalization_spatial.h"
 
 using mhdComplex = std::conditional_t<std::is_same_v<mhdReal, double>, cufftDoubleComplex, cufftComplex>;
 
@@ -109,6 +110,9 @@ struct HybridModelConfig {
 
 template <typename mhdReal, typename picReal>
 class HybridModel {
+    // Fresh analytic loading supplies a deterministic scalar expectation.
+    // Restart/loading of arbitrary stored markers retains the native path.
+    double normalizationReference[3] = {0.0, 0.0, 0.0};
 
   public:
     HybridModel(const HybridModelConfig& cfg)
@@ -5106,13 +5110,23 @@ class HybridModel {
         fillTempGhost(tempN);
         fillTempGhost(tempT);
 
-        auto interp3d = [&](const tempField& field, double x, double y, double z) {
+        auto interp3d = [&](const tempField& field, double x, double y, double z, bool boundaryNodes = false) {
             double li = (x - x0) / gridDx;
             double lj = (y - y0 + 0.5 * gridDy) / gridDy;
             double lk = (z - z0 + 0.5 * gridDz) / gridDz;
             int i = std::floor(li);
             int j = std::floor(lj);
             int k = std::floor(lk);
+            if (boundaryNodes) {
+                // Quadrature visits interpolation endpoints, unlike random loading.
+                // Clamp indices rather than nudging coordinates: division can round back to a node.
+                li = std::clamp(li, 0.0, double(gridNx - 1));
+                lj = std::clamp(lj, 0.0, double(gridNy));
+                lk = std::clamp(lk, 0.0, double(gridNz));
+                i = std::clamp(i, 0, gridNx - 2);
+                j = std::clamp(j, 0, gridNy);
+                k = std::clamp(k, 0, gridNz);
+            }
             double dx = li - i;
             double dy = lj - j;
             double dz = lk - k;
@@ -5138,6 +5152,23 @@ class HybridModel {
 
             return result;
         };
+
+        using namespace particle_normalization;
+        SpatialInput normalizationGrid{
+            gridNx, gridNy, gridNz, NFP == 1, spaceType == 0, gridDx, gridDy, gridDz,
+            x0, y0, z0, Jmax, static_cast<double>(picDev) * devNums * hostNums};
+        auto normalizationFields = [&](double x, double y, double z) {
+            return std::array<double, 4>{interp3d(tempJ, x, y, z, true), interp3d(tempN, x, y, z, true),
+                                         interp3d(tempT, x, y, z, true), interp3d(tempB, x, y, z, true)};
+        };
+        auto normalizationVelocity = [&](double temperature, double fieldB) {
+            VelocityInput input{
+                disType, velocityType == 0, Mass, temperature, fieldB, Vmin, Vmax, Vb,
+                DeltaV, Lambda0, DeltaLambda2, KEV / (MP * VA0 * VA0)};
+            return pressureMoment(input);
+        };
+        normalizationReference[picType] =
+            referencePressure(normalizationGrid, normalizationFields, normalizationVelocity);
 
         const int repeatNz = (NFP == 1) ? gridNz : 1;
         const int picLoad = picDev / repeatNz;
@@ -5698,7 +5729,10 @@ class HybridModel {
 
         innerP /= gridNy * gridNz;
 
-        *picConst = Beta / innerP;
+        const picReal referenceP = normalizationReference[picType] > 0 ? normalizationReference[picType] : innerP;
+        if (normalizationReference[picType] > 0 && !(referenceP > 0 && std::isfinite(referenceP)))
+            throw std::runtime_error("Reference pressure is outside particle precision range");
+        *picConst = Beta / referenceP;
 
         std::vector<picReal> density(gridNx);
         std::vector<picReal> pressure(gridNx);
