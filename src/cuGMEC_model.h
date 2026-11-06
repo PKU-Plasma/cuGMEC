@@ -5698,6 +5698,43 @@ class HybridModel {
 
         innerP /= gridNy * gridNz;
 
+        // For an isothermal Maxwellian, the pressure shape follows density even with speed cuts.
+        // Estimate its reference amplitude from all radial samples, not just the inner surface.
+        constexpr auto distribution = picType == 0 ? IonType : (picType == 1 ? AlphaType : BeamType);
+        constexpr auto sampling = picType == 0 ? IonSpace : (picType == 1 ? AlphaSpace : BeamSpace);
+        if constexpr (std::is_same_v<ifContinue, falseType> && distribution == Maxwell) {
+            const auto densityProfile = picType == 0 ? Ni : (picType == 1 ? Na : Nb);
+            const auto temperatureProfile = picType == 0 ? Ti : (picType == 1 ? Ta : Tb);
+            const double tolerance = 64 * std::numeric_limits<double>::epsilon();
+            bool isothermal = temperatureProfile[0][0][0] > 0, constantDensity = true, nonnegativeDensity = true;
+            double totalP = 0.0, totalN = 0.0, referenceN = 0.0;
+            for (int i = 0; i < gridNx; i++) {
+                const double weight = (i == 0 || i == gridNx - 1) ? 0.5 : 1.0;
+                for (int j = 0; j < gridNy; j++) {
+                    for (int k = 0; k < gridNz; k++) {
+                        const int equilK = (NFP == 1) ? 0 : k;
+                        const double n = densityProfile[i][j][equilK];
+                        nonnegativeDensity &= n >= 0 && std::isfinite(n);
+                        isothermal &= std::abs(temperatureProfile[i][j][equilK] - temperatureProfile[0][0][0]) <=
+                                      tolerance * std::abs(temperatureProfile[0][0][0]);
+                        constantDensity &= std::abs(n - densityProfile[0][0][0]) <=
+                                           tolerance * std::abs(densityProfile[0][0][0]);
+                        totalP += weight * globalP[j + gridGhost][i][k + gridGhost];
+                        totalN += weight * n;
+                        if (i == 0)
+                            referenceN += n;
+                    }
+                }
+            }
+            // Nonuniform real-space loading can saturate N*J/Jmax and distort the density shape.
+            if (isothermal && nonnegativeDensity && (sampling == spaceUniform || constantDensity) &&
+                totalN > 0 && referenceN > 0) {
+                const picReal referenceP = totalP * (referenceN / (gridNy * gridNz)) / totalN;
+                if (referenceP > 0 && std::isfinite(referenceP) && std::isfinite(Beta / referenceP))
+                    innerP = referenceP;
+            }
+        }
+
         *picConst = Beta / innerP;
 
         std::vector<picReal> density(gridNx);
